@@ -1,13 +1,13 @@
 package zeroconf
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"log"
 	"math/rand"
 	"net"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -25,38 +25,28 @@ const (
 // Register a service by given arguments. This call will take the system's hostname
 // and lookup IP by that hostname.
 func Register(instance, service, domain string, port int, text []string, ifaces []net.Interface) (*Server, error) {
-	return register(instance, service, domain, port, text, ifaces, false)
-}
-
-// RegisterDynamic registers a service by the given arguments. This call will take the system's hostname
-// and look up IPs as requests come in on a particular interface.
-func RegisterDynamic(instance, service, domain string, port int, text []string, ifaces []net.Interface) (*Server, error) {
-	return register(instance, service, domain, port, text, ifaces, true)
-}
-
-func register(instance, service, domain string, port int, text []string, ifaces []net.Interface, dynamic bool) (*Server, error) {
 	entry := NewServiceEntry(instance, service, domain)
 	entry.Port = port
 	entry.Text = text
 
 	if entry.Instance == "" {
-		return nil, errors.New("missing service instance name")
+		return nil, fmt.Errorf("missing service instance name")
 	}
 	if entry.Service == "" {
-		return nil, errors.New("missing service name")
+		return nil, fmt.Errorf("missing service name")
 	}
 	if entry.Domain == "" {
 		entry.Domain = "local."
 	}
 	if entry.Port == 0 {
-		return nil, errors.New("missing port")
+		return nil, fmt.Errorf("missing port")
 	}
 
 	var err error
 	if entry.HostName == "" {
 		entry.HostName, err = os.Hostname()
 		if err != nil {
-			return nil, errors.New("could not determine host")
+			return nil, fmt.Errorf("could not determine host")
 		}
 	}
 
@@ -68,19 +58,26 @@ func register(instance, service, domain string, port int, text []string, ifaces 
 		ifaces = listMulticastInterfaces()
 	}
 
-	if !dynamic {
-		for _, iface := range ifaces {
-			v4, v6 := addrsForInterface(&iface)
-			entry.AddrIPv4 = append(entry.AddrIPv4, v4...)
-			entry.AddrIPv6 = append(entry.AddrIPv6, v6...)
-		}
-
-		if entry.AddrIPv4 == nil && entry.AddrIPv6 == nil {
-			return nil, errors.New("could not determine host IP addresses")
-		}
+	for _, iface := range ifaces {
+		v4, v6 := addrsForInterface(&iface)
+		entry.AddrIPv4 = append(entry.AddrIPv4, v4...)
+		entry.AddrIPv6 = append(entry.AddrIPv6, v6...)
 	}
 
-	return newServerForService(entry, ifaces)
+	if entry.AddrIPv4 == nil && entry.AddrIPv6 == nil {
+		return nil, fmt.Errorf("could not determine host IP addresses")
+	}
+
+	s, err := newServer(ifaces)
+	if err != nil {
+		return nil, err
+	}
+
+	s.service = entry
+	go s.mainloop()
+	go s.probe()
+
+	return s, nil
 }
 
 // RegisterProxy registers a service proxy. This call will skip the hostname/IP lookup and
@@ -92,19 +89,19 @@ func RegisterProxy(instance, service, domain string, port int, host string, ips 
 	entry.HostName = host
 
 	if entry.Instance == "" {
-		return nil, errors.New("missing service instance name")
+		return nil, fmt.Errorf("missing service instance name")
 	}
 	if entry.Service == "" {
-		return nil, errors.New("missing service name")
+		return nil, fmt.Errorf("missing service name")
 	}
 	if entry.HostName == "" {
-		return nil, errors.New("missing host name")
+		return nil, fmt.Errorf("missing host name")
 	}
 	if entry.Domain == "" {
 		entry.Domain = "local"
 	}
 	if entry.Port == 0 {
-		return nil, errors.New("missing port")
+		return nil, fmt.Errorf("missing port")
 	}
 
 	if !strings.HasSuffix(trimDot(entry.HostName), entry.Domain) {
@@ -128,21 +125,14 @@ func RegisterProxy(instance, service, domain string, port int, host string, ips 
 		ifaces = listMulticastInterfaces()
 	}
 
-	return newServerForService(entry, ifaces)
-}
-
-func newServerForService(entry *ServiceEntry, ifaces []net.Interface) (*Server, error) {
 	s, err := newServer(ifaces)
 	if err != nil {
 		return nil, err
 	}
 
 	s.service = entry
-	s.startReceivers()
-	s.shutdownEnd.Add(1)
-	s.startupWait.Add(1)
-	managedGo(s.probe, s.shutdownEnd.Done)
-	s.startupWait.Wait()
+	go s.mainloop()
+	go s.probe()
 
 	return s, nil
 }
@@ -158,13 +148,11 @@ type Server struct {
 	ipv6conn *ipv6.PacketConn
 	ifaces   []net.Interface
 
-	shutdownCtx       context.Context
-	shutdownCtxCancel func()
-	shutdownLock      sync.Mutex
-	shutdownEnd       sync.WaitGroup
-	isShutdown        bool
-	ttl               uint32
-	startupWait       sync.WaitGroup
+	shouldShutdown chan struct{}
+	shutdownLock   sync.Mutex
+	shutdownEnd    sync.WaitGroup
+	isShutdown     bool
+	ttl            uint32
 }
 
 // Constructs server structure
@@ -179,45 +167,27 @@ func newServer(ifaces []net.Interface) (*Server, error) {
 	}
 	if err4 != nil && err6 != nil {
 		// No supported interface left.
-		return nil, errors.New("no supported interface")
+		return nil, fmt.Errorf("no supported interface")
 	}
 
-	shutdownCtx, shutdownCtxCancel := context.WithCancel(context.Background())
 	s := &Server{
-		ipv4conn:          ipv4conn,
-		ipv6conn:          ipv6conn,
-		ifaces:            ifaces,
-		ttl:               3200,
-		shutdownCtx:       shutdownCtx,
-		shutdownCtxCancel: shutdownCtxCancel,
+		ipv4conn:       ipv4conn,
+		ipv6conn:       ipv6conn,
+		ifaces:         ifaces,
+		ttl:            3200,
+		shouldShutdown: make(chan struct{}),
 	}
 
 	return s, nil
 }
 
-// startReceivers starts both IPv4/6 receiver loops and and waits for the shutdown signal from exit channel
-func (s *Server) startReceivers() {
+// Start listeners and waits for the shutdown signal from exit channel
+func (s *Server) mainloop() {
 	if s.ipv4conn != nil {
-		s.startupWait.Add(1)
-		s.shutdownEnd.Add(1)
-		var nextInstance bool
-		managedGo(func() {
-			defer func() {
-				nextInstance = true
-			}()
-			s.recv4(s.ipv4conn, !nextInstance)
-		}, s.shutdownEnd.Done)
+		go s.recv4(s.ipv4conn)
 	}
 	if s.ipv6conn != nil {
-		s.shutdownEnd.Add(1)
-		s.startupWait.Add(1)
-		var nextInstance bool
-		managedGo(func() {
-			defer func() {
-				nextInstance = true
-			}()
-			s.recv6(s.ipv6conn, !nextInstance)
-		}, s.shutdownEnd.Done)
+		go s.recv6(s.ipv6conn)
 	}
 }
 
@@ -247,7 +217,7 @@ func (s *Server) shutdown() error {
 
 	err := s.unregister()
 
-	s.shutdownCtxCancel()
+	close(s.shouldShutdown)
 
 	if s.ipv4conn != nil {
 		s.ipv4conn.Close()
@@ -264,21 +234,18 @@ func (s *Server) shutdown() error {
 }
 
 // recv is a long running routine to receive packets from an interface
-func (s *Server) recv4(c *ipv4.PacketConn, firstInstance bool) {
+func (s *Server) recv4(c *ipv4.PacketConn) {
 	if c == nil {
 		return
 	}
-	firstRecv := firstInstance
 	buf := make([]byte, 65536)
+	s.shutdownEnd.Add(1)
+	defer s.shutdownEnd.Done()
 	for {
 		select {
-		case <-s.shutdownCtx.Done():
+		case <-s.shouldShutdown:
 			return
 		default:
-			if firstRecv {
-				s.startupWait.Done()
-				firstRecv = false
-			}
 			var ifIndex int
 			n, cm, from, err := c.ReadFrom(buf)
 			if err != nil {
@@ -293,21 +260,18 @@ func (s *Server) recv4(c *ipv4.PacketConn, firstInstance bool) {
 }
 
 // recv is a long running routine to receive packets from an interface
-func (s *Server) recv6(c *ipv6.PacketConn, firstInstance bool) {
+func (s *Server) recv6(c *ipv6.PacketConn) {
 	if c == nil {
 		return
 	}
-	firstRecv := firstInstance
 	buf := make([]byte, 65536)
+	s.shutdownEnd.Add(1)
+	defer s.shutdownEnd.Done()
 	for {
 		select {
-		case <-s.shutdownCtx.Done():
+		case <-s.shouldShutdown:
 			return
 		default:
-			if firstRecv {
-				s.startupWait.Done()
-				firstRecv = false
-			}
 			var ifIndex int
 			n, cm, from, err := c.ReadFrom(buf)
 			if err != nil {
@@ -561,7 +525,7 @@ func (s *Server) serviceTypeName(resp *dns.Msg, ttl uint32) {
 }
 
 // Perform probing & announcement
-//TODO: implement a proper probing & conflict resolution
+// TODO: implement a proper probing & conflict resolution
 func (s *Server) probe() {
 	q := new(dns.Msg)
 	q.SetQuestion(s.service.ServiceInstanceName(), dns.TypePTR)
@@ -596,12 +560,7 @@ func (s *Server) probe() {
 		if err := s.multicastResponse(q, 0); err != nil {
 			log.Println("[ERR] zeroconf: failed to send probe:", err.Error())
 		}
-		if i == 0 {
-			s.startupWait.Done()
-		}
-		if !selectContextOrWait(s.shutdownCtx, time.Duration(randomizer.Intn(250))*time.Millisecond) {
-			return
-		}
+		time.Sleep(time.Duration(randomizer.Intn(250)) * time.Millisecond)
 	}
 
 	// From RFC6762
@@ -624,9 +583,7 @@ func (s *Server) probe() {
 				log.Println("[ERR] zeroconf: failed to send announcement:", err.Error())
 			}
 		}
-		if !selectContextOrWait(s.shutdownCtx, timeout) {
-			return
-		}
+		time.Sleep(timeout)
 		timeout *= 2
 	}
 }
@@ -765,26 +722,62 @@ func (s *Server) multicastResponse(msg *dns.Msg, ifIndex int) error {
 		return err
 	}
 	if s.ipv4conn != nil {
+		// See https://pkg.go.dev/golang.org/x/net/ipv4#pkg-note-BUG
+		// As of Golang 1.18.4
+		// On Windows, the ControlMessage for ReadFrom and WriteTo methods of PacketConn is not implemented.
 		var wcm ipv4.ControlMessage
 		if ifIndex != 0 {
-			wcm.IfIndex = ifIndex
+			switch runtime.GOOS {
+			case "darwin", "ios", "linux":
+				wcm.IfIndex = ifIndex
+			default:
+				iface, _ := net.InterfaceByIndex(ifIndex)
+				if err := s.ipv4conn.SetMulticastInterface(iface); err != nil {
+					log.Printf("[WARN] mdns: Failed to set multicast interface: %v", err)
+				}
+			}
 			s.ipv4conn.WriteTo(buf, &wcm, ipv4Addr)
 		} else {
 			for _, intf := range s.ifaces {
-				wcm.IfIndex = intf.Index
+				switch runtime.GOOS {
+				case "darwin", "ios", "linux":
+					wcm.IfIndex = intf.Index
+				default:
+					if err := s.ipv4conn.SetMulticastInterface(&intf); err != nil {
+						log.Printf("[WARN] mdns: Failed to set multicast interface: %v", err)
+					}
+				}
 				s.ipv4conn.WriteTo(buf, &wcm, ipv4Addr)
 			}
 		}
 	}
 
 	if s.ipv6conn != nil {
+		// See https://pkg.go.dev/golang.org/x/net/ipv6#pkg-note-BUG
+		// As of Golang 1.18.4
+		// On Windows, the ControlMessage for ReadFrom and WriteTo methods of PacketConn is not implemented.
 		var wcm ipv6.ControlMessage
 		if ifIndex != 0 {
-			wcm.IfIndex = ifIndex
+			switch runtime.GOOS {
+			case "darwin", "ios", "linux":
+				wcm.IfIndex = ifIndex
+			default:
+				iface, _ := net.InterfaceByIndex(ifIndex)
+				if err := s.ipv6conn.SetMulticastInterface(iface); err != nil {
+					log.Printf("[WARN] mdns: Failed to set multicast interface: %v", err)
+				}
+			}
 			s.ipv6conn.WriteTo(buf, &wcm, ipv6Addr)
 		} else {
 			for _, intf := range s.ifaces {
-				wcm.IfIndex = intf.Index
+				switch runtime.GOOS {
+				case "darwin", "ios", "linux":
+					wcm.IfIndex = intf.Index
+				default:
+					if err := s.ipv6conn.SetMulticastInterface(&intf); err != nil {
+						log.Printf("[WARN] mdns: Failed to set multicast interface: %v", err)
+					}
+				}
 				s.ipv6conn.WriteTo(buf, &wcm, ipv6Addr)
 			}
 		}
