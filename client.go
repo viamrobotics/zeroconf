@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"net"
 	"runtime"
 	"strings"
@@ -12,6 +11,7 @@ import (
 	"time"
 
 	"github.com/cenkalti/backoff"
+	"github.com/edaniels/golog"
 	"github.com/miekg/dns"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -77,7 +77,7 @@ type Resolver struct {
 
 // NewResolver creates a new resolver and joins the UDP multicast groups to
 // listen for mDNS messages.
-func NewResolver(options ...ClientOption) (*Resolver, error) {
+func NewResolver(logger golog.Logger, options ...ClientOption) (*Resolver, error) {
 	// Apply default configuration and load supplied options.
 	var conf = clientOpts{
 		listenOn:   IPv4AndIPv6,
@@ -91,8 +91,9 @@ func NewResolver(options ...ClientOption) (*Resolver, error) {
 
 	shutdownCtx, shutdownCtxCancel := context.WithCancel(context.Background())
 	var shutdownEnd sync.WaitGroup
-	c, err := newClient(shutdownCtx, &shutdownEnd, conf)
+	c, err := newClient(shutdownCtx, &shutdownEnd, conf, logger)
 	if err != nil {
+		shutdownCtxCancel()
 		return nil, err
 	}
 	return &Resolver{
@@ -189,6 +190,7 @@ type client struct {
 	ipv6conn    *ipv6.PacketConn
 	ifaces      []net.Interface
 	acceptOnly  IPType
+	logger      golog.Logger
 }
 
 // Client structure constructor
@@ -196,6 +198,7 @@ func newClient(
 	shutdownCtx context.Context,
 	shutdownEnd *sync.WaitGroup,
 	opts clientOpts,
+	logger golog.Logger,
 ) (*client, error) {
 	ifaces := opts.ifaces
 	if len(ifaces) == 0 {
@@ -227,6 +230,7 @@ func newClient(
 		ipv6conn:    ipv6conn,
 		ifaces:      ifaces,
 		acceptOnly:  opts.acceptOnly,
+		logger:      logger,
 	}, nil
 }
 
@@ -524,7 +528,7 @@ func (c *client) sendQuery(msg *dns.Msg) error {
 				wcm.IfIndex = c.ifaces[ifi].Index
 			default:
 				if err := c.ipv4conn.SetMulticastInterface(&c.ifaces[ifi]); err != nil {
-					log.Printf("[WARN] mdns: Failed to set multicast interface: %v", err)
+					c.logger.Debugw("mdns: failed to set multicast interface", "error", err)
 				}
 			}
 			c.ipv4conn.WriteTo(buf, &wcm, ipv4Addr)
@@ -542,7 +546,7 @@ func (c *client) sendQuery(msg *dns.Msg) error {
 				wcm.IfIndex = c.ifaces[ifi].Index
 			default:
 				if err := c.ipv6conn.SetMulticastInterface(&c.ifaces[ifi]); err != nil {
-					log.Printf("[WARN] mdns: Failed to set multicast interface: %v", err)
+					c.logger.Debugw("mdns: failed to set multicast interface", "error", err)
 				}
 			}
 			c.ipv6conn.WriteTo(buf, &wcm, ipv6Addr)

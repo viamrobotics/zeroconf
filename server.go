@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"math/rand"
 	"net"
 	"os"
@@ -13,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/edaniels/golog"
 	"github.com/miekg/dns"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -25,17 +25,36 @@ const (
 
 // Register a service by given arguments. This call will take the system's hostname
 // and lookup IP by that hostname.
-func Register(instance, service, domain string, port int, text []string, ifaces []net.Interface) (*Server, error) {
-	return register(instance, service, domain, port, text, ifaces, false)
+func Register(
+	instance, service, domain string,
+	port int,
+	text []string,
+	ifaces []net.Interface,
+	logger golog.Logger,
+) (*Server, error) {
+	return register(instance, service, domain, port, text, ifaces, false, logger)
 }
 
 // RegisterDynamic registers a service by the given arguments. This call will take the system's hostname
 // and look up IPs as requests come in on a particular interface.
-func RegisterDynamic(instance, service, domain string, port int, text []string, ifaces []net.Interface) (*Server, error) {
-	return register(instance, service, domain, port, text, ifaces, true)
+func RegisterDynamic(
+	instance, service, domain string,
+	port int,
+	text []string,
+	ifaces []net.Interface,
+	logger golog.Logger,
+) (*Server, error) {
+	return register(instance, service, domain, port, text, ifaces, true, logger)
 }
 
-func register(instance, service, domain string, port int, text []string, ifaces []net.Interface, dynamic bool) (*Server, error) {
+func register(
+	instance, service, domain string,
+	port int,
+	text []string,
+	ifaces []net.Interface,
+	dynamic bool,
+	logger golog.Logger,
+) (*Server, error) {
 	entry := NewServiceEntry(instance, service, domain)
 	entry.Port = port
 	entry.Text = text
@@ -81,12 +100,20 @@ func register(instance, service, domain string, port int, text []string, ifaces 
 		}
 	}
 
-	return newServerForService(entry, ifaces)
+	return newServerForService(entry, ifaces, logger)
 }
 
 // RegisterProxy registers a service proxy. This call will skip the hostname/IP lookup and
 // will use the provided values.
-func RegisterProxy(instance, service, domain string, port int, host string, ips []string, text []string, ifaces []net.Interface) (*Server, error) {
+func RegisterProxy(
+	instance, service, domain string,
+	port int,
+	host string,
+	ips []string,
+	text []string,
+	ifaces []net.Interface,
+	logger golog.Logger,
+) (*Server, error) {
 	entry := NewServiceEntry(instance, service, domain)
 	entry.Port = port
 	entry.Text = text
@@ -129,11 +156,11 @@ func RegisterProxy(instance, service, domain string, port int, host string, ips 
 		ifaces = listMulticastInterfaces()
 	}
 
-	return newServerForService(entry, ifaces)
+	return newServerForService(entry, ifaces, logger)
 }
 
-func newServerForService(entry *ServiceEntry, ifaces []net.Interface) (*Server, error) {
-	s, err := newServer(ifaces)
+func newServerForService(entry *ServiceEntry, ifaces []net.Interface, logger golog.Logger) (*Server, error) {
+	s, err := newServer(ifaces, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -158,6 +185,7 @@ type Server struct {
 	ipv4conn *ipv4.PacketConn
 	ipv6conn *ipv6.PacketConn
 	ifaces   []net.Interface
+	logger   golog.Logger
 
 	shutdownCtx       context.Context
 	shutdownCtxCancel func()
@@ -169,14 +197,14 @@ type Server struct {
 }
 
 // Constructs server structure
-func newServer(ifaces []net.Interface) (*Server, error) {
+func newServer(ifaces []net.Interface, logger golog.Logger) (*Server, error) {
 	ipv4conn, err4 := joinUdp4Multicast(ifaces)
 	if err4 != nil {
-		log.Printf("[zeroconf] no suitable IPv4 interface: %s", err4.Error())
+		logger.Debugw("no suitable IPv4 interface", "error", err4.Error())
 	}
 	ipv6conn, err6 := joinUdp6Multicast(ifaces)
 	if err6 != nil {
-		log.Printf("[zeroconf] no suitable IPv6 interface: %s", err6.Error())
+		logger.Debugw("no suitable IPv6 interface", "error", err6.Error())
 	}
 	if err4 != nil && err6 != nil {
 		// No supported interface left.
@@ -191,6 +219,7 @@ func newServer(ifaces []net.Interface) (*Server, error) {
 		ttl:               3200,
 		shutdownCtx:       shutdownCtx,
 		shutdownCtxCancel: shutdownCtxCancel,
+		logger:            logger,
 	}
 
 	return s, nil
@@ -595,7 +624,7 @@ func (s *Server) probe() {
 
 	for i := 0; i < multicastRepetitions; i++ {
 		if err := s.multicastResponse(q, 0); err != nil {
-			log.Println("[ERR] zeroconf: failed to send probe:", err.Error())
+			s.logger.Debugw("failed to send probe", "error", err.Error())
 		}
 		if i == 0 {
 			s.startupWait.Done()
@@ -622,7 +651,7 @@ func (s *Server) probe() {
 			resp.Extra = []dns.RR{}
 			s.composeLookupAnswers(resp, s.ttl, intf.Index, true)
 			if err := s.multicastResponse(resp, intf.Index); err != nil {
-				log.Println("[ERR] zeroconf: failed to send announcement:", err.Error())
+				s.logger.Debugw("failed to send announcement", "error", err.Error())
 			}
 		}
 		if !selectContextOrWait(s.shutdownCtx, timeout) {
@@ -778,7 +807,7 @@ func (s *Server) multicastResponse(msg *dns.Msg, ifIndex int) error {
 			default:
 				iface, _ := net.InterfaceByIndex(ifIndex)
 				if err := s.ipv4conn.SetMulticastInterface(iface); err != nil {
-					log.Printf("[WARN] mdns: Failed to set multicast interface: %v", err)
+					s.logger.Debugw("mdns: failed to set multicast interface", "error", err)
 				}
 			}
 			s.ipv4conn.WriteTo(buf, &wcm, ipv4Addr)
@@ -790,7 +819,7 @@ func (s *Server) multicastResponse(msg *dns.Msg, ifIndex int) error {
 					wcm.IfIndex = intf.Index
 				default:
 					if err := s.ipv4conn.SetMulticastInterface(&intf); err != nil {
-						log.Printf("[WARN] mdns: Failed to set multicast interface: %v", err)
+						s.logger.Debugw("mdns: failed to set multicast interface", "error", err)
 					}
 				}
 				s.ipv4conn.WriteTo(buf, &wcm, ipv4Addr)
@@ -811,7 +840,7 @@ func (s *Server) multicastResponse(msg *dns.Msg, ifIndex int) error {
 			default:
 				iface, _ := net.InterfaceByIndex(ifIndex)
 				if err := s.ipv6conn.SetMulticastInterface(iface); err != nil {
-					log.Printf("[WARN] mdns: Failed to set multicast interface: %v", err)
+					s.logger.Debugw("mdns: failed to set multicast interface", "error", err)
 				}
 			}
 			s.ipv6conn.WriteTo(buf, &wcm, ipv6Addr)
@@ -823,7 +852,7 @@ func (s *Server) multicastResponse(msg *dns.Msg, ifIndex int) error {
 					wcm.IfIndex = intf.Index
 				default:
 					if err := s.ipv6conn.SetMulticastInterface(&intf); err != nil {
-						log.Printf("[WARN] mdns: Failed to set multicast interface: %v", err)
+						s.logger.Debugw("mdns: failed to set multicast interface", "error", err)
 					}
 				}
 				s.ipv6conn.WriteTo(buf, &wcm, ipv6Addr)

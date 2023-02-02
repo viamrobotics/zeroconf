@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/edaniels/golog"
 	"github.com/pkg/errors"
 )
 
@@ -17,9 +18,10 @@ var (
 	mdnsPort    = 8888
 )
 
-func startMDNS(ctx context.Context, port int, name, service, domain string) {
+func startMDNS(t *testing.T, ctx context.Context, port int, name, service, domain string) {
+	logger := golog.NewTestLogger(t)
 	// 5353 is default mdns port
-	server, err := Register(name, service, domain, port, []string{"txtv=0", "lo=1", "la=2"}, nil)
+	server, err := Register(name, service, domain, port, []string{"txtv=0", "lo=1", "la=2"}, nil, logger)
 	if err != nil {
 		panic(errors.Wrap(err, "while registering mdns service"))
 	}
@@ -35,7 +37,7 @@ func TestBasic(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	go startMDNS(ctx, mdnsPort, mdnsName, mdnsService, mdnsDomain)
+	go startMDNS(t, ctx, mdnsPort, mdnsName, mdnsService, mdnsDomain)
 
 	time.Sleep(time.Second)
 
@@ -95,7 +97,7 @@ func TestSubtype(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
-		go startMDNS(ctx, mdnsPort, mdnsName, mdnsSubtype, mdnsDomain)
+		go startMDNS(t, ctx, mdnsPort, mdnsName, mdnsSubtype, mdnsDomain)
 
 		time.Sleep(time.Second)
 
@@ -131,7 +133,7 @@ func TestSubtype(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
-		go startMDNS(ctx, mdnsPort, mdnsName, mdnsSubtype, mdnsDomain)
+		go startMDNS(t, ctx, mdnsPort, mdnsName, mdnsSubtype, mdnsDomain)
 
 		time.Sleep(time.Second)
 
