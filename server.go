@@ -7,7 +7,6 @@ import (
 	"math/rand"
 	"net"
 	"os"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -181,11 +180,13 @@ const (
 
 // Server structure encapsulates both IPv4/IPv6 UDP connections
 type Server struct {
-	service  *ServiceEntry
-	ipv4conn *ipv4.PacketConn
-	ipv6conn *ipv6.PacketConn
-	ifaces   []net.Interface
-	logger   golog.Logger
+	service              *ServiceEntry
+	ipv4conn             *ipv4.PacketConn
+	ipv4Ifaces           []net.Interface
+	ipv6conn             *ipv6.PacketConn
+	ipv6Ifaces           []net.Interface
+	selectedIfaceIndexes map[int]struct{}
+	logger               golog.Logger
 
 	shutdownCtx       context.Context
 	shutdownCtxCancel func()
@@ -198,11 +199,11 @@ type Server struct {
 
 // Constructs server structure
 func newServer(ifaces []net.Interface, logger golog.Logger) (*Server, error) {
-	ipv4conn, err4 := joinUdp4Multicast(ifaces)
+	ipv4conn, ipv4Ifaces, err4 := joinUdp4Multicast(ifaces)
 	if err4 != nil {
 		logger.Debugw("no suitable IPv4 interface", "error", err4.Error())
 	}
-	ipv6conn, err6 := joinUdp6Multicast(ifaces)
+	ipv6conn, ipv6Ifaces, err6 := joinUdp6Multicast(ifaces)
 	if err6 != nil {
 		logger.Debugw("no suitable IPv6 interface", "error", err6.Error())
 	}
@@ -210,16 +211,25 @@ func newServer(ifaces []net.Interface, logger golog.Logger) (*Server, error) {
 		// No supported interface left.
 		return nil, errors.New("no supported interface")
 	}
+	selectedIfaceIndexes := map[int]struct{}{}
+	for _, ifc := range ipv4Ifaces {
+		selectedIfaceIndexes[ifc.Index] = struct{}{}
+	}
+	for _, ifc := range ipv6Ifaces {
+		selectedIfaceIndexes[ifc.Index] = struct{}{}
+	}
 
 	shutdownCtx, shutdownCtxCancel := context.WithCancel(context.Background())
 	s := &Server{
-		ipv4conn:          ipv4conn,
-		ipv6conn:          ipv6conn,
-		ifaces:            ifaces,
-		ttl:               3200,
-		shutdownCtx:       shutdownCtx,
-		shutdownCtxCancel: shutdownCtxCancel,
-		logger:            logger,
+		ipv4conn:             ipv4conn,
+		ipv4Ifaces:           ipv4Ifaces,
+		ipv6conn:             ipv6conn,
+		ipv6Ifaces:           ipv6Ifaces,
+		selectedIfaceIndexes: selectedIfaceIndexes,
+		ttl:                  3200,
+		shutdownCtx:          shutdownCtx,
+		shutdownCtxCancel:    shutdownCtxCancel,
+		logger:               logger,
 	}
 
 	return s, nil
@@ -642,15 +652,15 @@ func (s *Server) probe() {
 	//    at least a factor of two with every response sent.
 	timeout := 1 * time.Second
 	for i := 0; i < multicastRepetitions; i++ {
-		for _, intf := range s.ifaces {
+		for intfIndex := range s.selectedIfaceIndexes {
 			resp := new(dns.Msg)
 			resp.MsgHdr.Response = true
 			// TODO: make response authoritative if we are the publisher
 			resp.Compress = true
 			resp.Answer = []dns.RR{}
 			resp.Extra = []dns.RR{}
-			s.composeLookupAnswers(resp, s.ttl, intf.Index, true)
-			if err := s.multicastResponse(resp, intf.Index); err != nil {
+			s.composeLookupAnswers(resp, s.ttl, intfIndex, true)
+			if err := s.multicastResponse(resp, intfIndex); err != nil {
 				s.logger.Debugw("failed to send announcement", "error", err.Error())
 			}
 		}
@@ -800,67 +810,42 @@ func (s *Server) multicastResponse(msg *dns.Msg, ifIndex int) error {
 		return err
 	}
 	if s.ipv4conn != nil {
-		// See https://pkg.go.dev/golang.org/x/net/ipv4#pkg-note-BUG
-		// As of Golang 1.18.4
-		// On Windows, the ControlMessage for ReadFrom and WriteTo methods of PacketConn is not implemented.
-		var wcm ipv4.ControlMessage
 		if ifIndex != 0 {
-			wcm.IfIndex = ifIndex
-			switch runtime.GOOS {
-			case "darwin", "ios", "linux":
-				wcm.IfIndex = ifIndex
-			default:
-				iface, _ := net.InterfaceByIndex(ifIndex)
-				if err := s.ipv4conn.SetMulticastInterface(iface); err != nil {
-					s.logger.Debugw("mdns: failed to set multicast interface", "error", err)
-				}
+			iface, _ := net.InterfaceByIndex(ifIndex)
+			if err := s.ipv4conn.SetMulticastInterface(iface); err != nil {
+				return err
 			}
-			s.ipv4conn.WriteTo(buf, &wcm, ipv4Addr)
+			if _, err := s.ipv4conn.WriteTo(buf, nil, ipv4Addr); err != nil {
+				return err
+			}
 		} else {
-			for _, intf := range s.ifaces {
-				wcm.IfIndex = intf.Index
-				switch runtime.GOOS {
-				case "darwin", "ios", "linux":
-					wcm.IfIndex = intf.Index
-				default:
-					if err := s.ipv4conn.SetMulticastInterface(&intf); err != nil {
-						s.logger.Debugw("mdns: failed to set multicast interface", "error", err)
-					}
+			for _, intf := range s.ipv4Ifaces {
+				if err := s.ipv4conn.SetMulticastInterface(&intf); err != nil {
+					s.logger.Debugw("mdns: failed to set multicast interface", "error", err)
+				} else {
+					s.ipv4conn.WriteTo(buf, nil, ipv4Addr)
 				}
-				s.ipv4conn.WriteTo(buf, &wcm, ipv4Addr)
 			}
 		}
 	}
 
 	if s.ipv6conn != nil {
-		// See https://pkg.go.dev/golang.org/x/net/ipv6#pkg-note-BUG
-		// As of Golang 1.18.4
-		// On Windows, the ControlMessage for ReadFrom and WriteTo methods of PacketConn is not implemented.
-		var wcm ipv6.ControlMessage
 		if ifIndex != 0 {
-			wcm.IfIndex = ifIndex
-			switch runtime.GOOS {
-			case "darwin", "ios", "linux":
-				wcm.IfIndex = ifIndex
-			default:
-				iface, _ := net.InterfaceByIndex(ifIndex)
-				if err := s.ipv6conn.SetMulticastInterface(iface); err != nil {
-					s.logger.Debugw("mdns: failed to set multicast interface", "error", err)
+			iface, _ := net.InterfaceByIndex(ifIndex)
+			if err := s.ipv6conn.SetMulticastInterface(iface); err != nil {
+				s.logger.Debugw("mdns: failed to set multicast interface", "error", err)
+			} else {
+				if _, err := s.ipv6conn.WriteTo(buf, nil, ipv6Addr); err != nil {
+					return err
 				}
 			}
-			s.ipv6conn.WriteTo(buf, &wcm, ipv6Addr)
 		} else {
-			for _, intf := range s.ifaces {
-				wcm.IfIndex = intf.Index
-				switch runtime.GOOS {
-				case "darwin", "ios", "linux":
-					wcm.IfIndex = intf.Index
-				default:
-					if err := s.ipv6conn.SetMulticastInterface(&intf); err != nil {
-						s.logger.Debugw("mdns: failed to set multicast interface", "error", err)
-					}
+			for _, intf := range s.ipv6Ifaces {
+				if err := s.ipv6conn.SetMulticastInterface(&intf); err != nil {
+					s.logger.Debugw("mdns: failed to set multicast interface", "error", err)
+				} else {
+					s.ipv6conn.WriteTo(buf, nil, ipv6Addr)
 				}
-				s.ipv6conn.WriteTo(buf, &wcm, ipv6Addr)
 			}
 		}
 	}

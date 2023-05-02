@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -187,8 +186,9 @@ type client struct {
 	shutdownCtx context.Context
 	shutdownEnd *sync.WaitGroup
 	ipv4conn    *ipv4.PacketConn
+	ipv4Ifaces  []net.Interface
 	ipv6conn    *ipv6.PacketConn
-	ifaces      []net.Interface
+	ipv6Ifaces  []net.Interface
 	acceptOnly  IPType
 	logger      golog.Logger
 }
@@ -206,18 +206,20 @@ func newClient(
 	}
 	// IPv4 interfaces
 	var ipv4conn *ipv4.PacketConn
+	var ipv4Ifaces []net.Interface
 	if (opts.listenOn & IPv4) > 0 {
 		var err error
-		ipv4conn, err = joinUdp4Multicast(ifaces)
+		ipv4conn, ipv4Ifaces, err = joinUdp4Multicast(ifaces)
 		if err != nil {
 			return nil, err
 		}
 	}
 	// IPv6 interfaces
 	var ipv6conn *ipv6.PacketConn
+	var ipv6Ifaces []net.Interface
 	if (opts.listenOn & IPv6) > 0 {
 		var err error
-		ipv6conn, err = joinUdp6Multicast(ifaces)
+		ipv6conn, ipv6Ifaces, err = joinUdp6Multicast(ifaces)
 		if err != nil {
 			return nil, err
 		}
@@ -227,8 +229,9 @@ func newClient(
 		shutdownCtx: shutdownCtx,
 		shutdownEnd: shutdownEnd,
 		ipv4conn:    ipv4conn,
+		ipv4Ifaces:  ipv4Ifaces,
 		ipv6conn:    ipv6conn,
-		ifaces:      ifaces,
+		ipv6Ifaces:  ipv6Ifaces,
 		acceptOnly:  opts.acceptOnly,
 		logger:      logger,
 	}, nil
@@ -517,39 +520,21 @@ func (c *client) sendQuery(msg *dns.Msg) error {
 		return err
 	}
 	if c.ipv4conn != nil {
-		// See https://pkg.go.dev/golang.org/x/net/ipv4#pkg-note-BUG
-		// As of Golang 1.18.4
-		// On Windows, the ControlMessage for ReadFrom and WriteTo methods of PacketConn is not implemented.
-		var wcm ipv4.ControlMessage
-		for ifi := range c.ifaces {
-			wcm.IfIndex = c.ifaces[ifi].Index
-			switch runtime.GOOS {
-			case "darwin", "ios", "linux":
-				wcm.IfIndex = c.ifaces[ifi].Index
-			default:
-				if err := c.ipv4conn.SetMulticastInterface(&c.ifaces[ifi]); err != nil {
-					c.logger.Debugw("mdns: failed to set multicast interface", "error", err)
-				}
+		for _, ifc := range c.ipv4Ifaces {
+			if err := c.ipv4conn.SetMulticastInterface(&ifc); err != nil {
+				c.logger.Debugw("mdns: failed to set multicast interface", "error", err)
+			} else {
+				c.ipv4conn.WriteTo(buf, nil, ipv4Addr)
 			}
-			c.ipv4conn.WriteTo(buf, &wcm, ipv4Addr)
 		}
 	}
 	if c.ipv6conn != nil {
-		// See https://pkg.go.dev/golang.org/x/net/ipv6#pkg-note-BUG
-		// As of Golang 1.18.4
-		// On Windows, the ControlMessage for ReadFrom and WriteTo methods of PacketConn is not implemented.
-		var wcm ipv6.ControlMessage
-		for ifi := range c.ifaces {
-			wcm.IfIndex = c.ifaces[ifi].Index
-			switch runtime.GOOS {
-			case "darwin", "ios", "linux":
-				wcm.IfIndex = c.ifaces[ifi].Index
-			default:
-				if err := c.ipv6conn.SetMulticastInterface(&c.ifaces[ifi]); err != nil {
-					c.logger.Debugw("mdns: failed to set multicast interface", "error", err)
-				}
+		for _, ifc := range c.ipv6Ifaces {
+			if err := c.ipv6conn.SetMulticastInterface(&ifc); err != nil {
+				c.logger.Debugw("mdns: failed to set multicast interface", "error", err)
+			} else {
+				c.ipv6conn.WriteTo(buf, nil, ipv6Addr)
 			}
-			c.ipv6conn.WriteTo(buf, &wcm, ipv6Addr)
 		}
 	}
 	return nil

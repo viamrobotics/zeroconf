@@ -34,6 +34,7 @@ func startMDNS(t *testing.T, ctx context.Context, port int, name, service, domai
 }
 
 func TestBasic(t *testing.T) {
+	logger := golog.NewTestLogger(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -41,7 +42,7 @@ func TestBasic(t *testing.T) {
 
 	time.Sleep(time.Second)
 
-	resolver, err := NewResolver(nil)
+	resolver, err := NewResolver(logger)
 	if err != nil {
 		t.Fatalf("Expected create resolver success, but got %v", err)
 	}
@@ -70,7 +71,8 @@ func TestBasic(t *testing.T) {
 }
 
 func TestNoRegister(t *testing.T) {
-	resolver, err := NewResolver(nil)
+	logger := golog.NewTestLogger(t)
+	resolver, err := NewResolver(logger)
 	if err != nil {
 		t.Fatalf("Expected create resolver success, but got %v", err)
 	}
@@ -94,6 +96,7 @@ func TestNoRegister(t *testing.T) {
 
 func TestSubtype(t *testing.T) {
 	t.Run("browse with subtype", func(t *testing.T) {
+		logger := golog.NewTestLogger(t)
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
@@ -101,7 +104,7 @@ func TestSubtype(t *testing.T) {
 
 		time.Sleep(time.Second)
 
-		resolver, err := NewResolver(nil)
+		resolver, err := NewResolver(logger)
 		if err != nil {
 			t.Fatalf("Expected create resolver success, but got %v", err)
 		}
@@ -130,6 +133,7 @@ func TestSubtype(t *testing.T) {
 	})
 
 	t.Run("browse without subtype", func(t *testing.T) {
+		logger := golog.NewTestLogger(t)
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
@@ -137,7 +141,7 @@ func TestSubtype(t *testing.T) {
 
 		time.Sleep(time.Second)
 
-		resolver, err := NewResolver(nil)
+		resolver, err := NewResolver(logger)
 		if err != nil {
 			t.Fatalf("Expected create resolver success, but got %v", err)
 		}
