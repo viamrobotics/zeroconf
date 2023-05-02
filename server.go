@@ -700,6 +700,11 @@ func (s *Server) appendAddrs(list []dns.RR, ttl uint32, ifIndex int, flushCache 
 			v6 = append(v6, a6...)
 		}
 	}
+	if iface, _ := net.InterfaceByIndex(ifIndex); iface != nil {
+		if (iface.Flags & net.FlagLoopback) > 0 {
+			v4 = append(v4, net.IPv4(127, 0, 0, 1))
+		}
+	}
 	if ttl > 0 {
 		// RFC6762 Section 10 says A/AAAA records SHOULD
 		// use TTL of 120s, to account for network interface
