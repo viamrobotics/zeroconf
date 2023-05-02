@@ -832,10 +832,9 @@ func (s *Server) multicastResponse(msg *dns.Msg, ifIndex int) error {
 		if ifIndex != 0 {
 			iface, _ := net.InterfaceByIndex(ifIndex)
 			if err := s.ipv4conn.SetMulticastInterface(iface); err != nil {
-				return err
-			}
-			if _, err := s.ipv4conn.WriteTo(buf, nil, ipv4Addr); err != nil {
-				return err
+				s.logger.Debugw("mdns: failed to set multicast interface", "error", err)
+			} else {
+				s.ipv4conn.WriteTo(buf, nil, ipv4Addr)
 			}
 		} else {
 			for ifcIdx := range s.ipv4Ifaces {
@@ -854,9 +853,7 @@ func (s *Server) multicastResponse(msg *dns.Msg, ifIndex int) error {
 			if err := s.ipv6conn.SetMulticastInterface(iface); err != nil {
 				s.logger.Debugw("mdns: failed to set multicast interface", "error", err)
 			} else {
-				if _, err := s.ipv6conn.WriteTo(buf, nil, ipv6Addr); err != nil {
-					return err
-				}
+				s.ipv6conn.WriteTo(buf, nil, ipv6Addr)
 			}
 		} else {
 			for ifcIdx := range s.ipv6Ifaces {
