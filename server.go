@@ -187,6 +187,7 @@ type Server struct {
 	ipv6Ifaces           []net.Interface
 	selectedIfaceIndexes map[int]struct{}
 	logger               golog.Logger
+	inboundBufferSize    int
 
 	shutdownCtx       context.Context
 	shutdownCtxCancel func()
@@ -211,12 +212,22 @@ func newServer(ifaces []net.Interface, logger golog.Logger) (*Server, error) {
 		// No supported interface left.
 		return nil, errors.New("no supported interface")
 	}
+	inboundBufferSize := 0
 	selectedIfaceIndexes := map[int]struct{}{}
 	for _, ifc := range ipv4Ifaces {
 		selectedIfaceIndexes[ifc.Index] = struct{}{}
+		if ifc.MTU > inboundBufferSize {
+			inboundBufferSize = ifc.MTU
+		}
 	}
 	for _, ifc := range ipv6Ifaces {
 		selectedIfaceIndexes[ifc.Index] = struct{}{}
+		if ifc.MTU > inboundBufferSize {
+			inboundBufferSize = ifc.MTU
+		}
+	}
+	if inboundBufferSize == 0 {
+		return nil, errNoPositiveMTUFound
 	}
 
 	shutdownCtx, shutdownCtxCancel := context.WithCancel(context.Background())
@@ -230,6 +241,12 @@ func newServer(ifaces []net.Interface, logger golog.Logger) (*Server, error) {
 		shutdownCtx:          shutdownCtx,
 		shutdownCtxCancel:    shutdownCtxCancel,
 		logger:               logger,
+
+		// https://www.rfc-editor.org/rfc/rfc6762.html#section-17
+		// Multicast DNS messages carried by UDP may be up to the IP MTU of the
+		// physical interface, less the space required for the IP header (20
+		// bytes for IPv4; 40 bytes for IPv6) and the UDP header (8 bytes).
+		inboundBufferSize: inboundBufferSize - 20 - 8,
 	}
 
 	return s, nil
@@ -777,7 +794,8 @@ func addrsForInterface(iface *net.Interface) ([]net.IP, []net.IP) {
 
 // unicastResponse is used to send a unicast response packet
 func (s *Server) unicastResponse(resp *dns.Msg, ifIndex int, from net.Addr) error {
-	buf, err := resp.Pack()
+	b := make([]byte, s.inboundBufferSize)
+	buf, err := resp.PackBuffer(b)
 	if err != nil {
 		return err
 	}
@@ -805,7 +823,8 @@ func (s *Server) unicastResponse(resp *dns.Msg, ifIndex int, from net.Addr) erro
 
 // multicastResponse us used to send a multicast response packet
 func (s *Server) multicastResponse(msg *dns.Msg, ifIndex int) error {
-	buf, err := msg.Pack()
+	b := make([]byte, s.inboundBufferSize)
+	buf, err := msg.PackBuffer(b)
 	if err != nil {
 		return err
 	}
@@ -819,8 +838,8 @@ func (s *Server) multicastResponse(msg *dns.Msg, ifIndex int) error {
 				return err
 			}
 		} else {
-			for _, intf := range s.ipv4Ifaces {
-				if err := s.ipv4conn.SetMulticastInterface(&intf); err != nil {
+			for ifcIdx := range s.ipv4Ifaces {
+				if err := s.ipv4conn.SetMulticastInterface(&s.ipv4Ifaces[ifcIdx]); err != nil {
 					s.logger.Debugw("mdns: failed to set multicast interface", "error", err)
 				} else {
 					s.ipv4conn.WriteTo(buf, nil, ipv4Addr)
@@ -840,8 +859,8 @@ func (s *Server) multicastResponse(msg *dns.Msg, ifIndex int) error {
 				}
 			}
 		} else {
-			for _, intf := range s.ipv6Ifaces {
-				if err := s.ipv6conn.SetMulticastInterface(&intf); err != nil {
+			for ifcIdx := range s.ipv6Ifaces {
+				if err := s.ipv6conn.SetMulticastInterface(&s.ipv6Ifaces[ifcIdx]); err != nil {
 					s.logger.Debugw("mdns: failed to set multicast interface", "error", err)
 				} else {
 					s.ipv6conn.WriteTo(buf, nil, ipv6Addr)

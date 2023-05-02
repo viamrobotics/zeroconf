@@ -183,15 +183,18 @@ func defaultParams(instance, service, domain string) *lookupParams {
 
 // Client structure encapsulates both IPv4/IPv6 UDP connections.
 type client struct {
-	shutdownCtx context.Context
-	shutdownEnd *sync.WaitGroup
-	ipv4conn    *ipv4.PacketConn
-	ipv4Ifaces  []net.Interface
-	ipv6conn    *ipv6.PacketConn
-	ipv6Ifaces  []net.Interface
-	acceptOnly  IPType
-	logger      golog.Logger
+	shutdownCtx       context.Context
+	shutdownEnd       *sync.WaitGroup
+	ipv4conn          *ipv4.PacketConn
+	ipv4Ifaces        []net.Interface
+	ipv6conn          *ipv6.PacketConn
+	ipv6Ifaces        []net.Interface
+	acceptOnly        IPType
+	logger            golog.Logger
+	inboundBufferSize int
 }
+
+var errNoPositiveMTUFound = errors.New("no positive MTU found")
 
 // Client structure constructor
 func newClient(
@@ -225,6 +228,21 @@ func newClient(
 		}
 	}
 
+	inboundBufferSize := 0
+	for _, ifc := range ipv4Ifaces {
+		if ifc.MTU > inboundBufferSize {
+			inboundBufferSize = ifc.MTU
+		}
+	}
+	for _, ifc := range ipv6Ifaces {
+		if ifc.MTU > inboundBufferSize {
+			inboundBufferSize = ifc.MTU
+		}
+	}
+	if inboundBufferSize == 0 {
+		return nil, errNoPositiveMTUFound
+	}
+
 	return &client{
 		shutdownCtx: shutdownCtx,
 		shutdownEnd: shutdownEnd,
@@ -234,6 +252,12 @@ func newClient(
 		ipv6Ifaces:  ipv6Ifaces,
 		acceptOnly:  opts.acceptOnly,
 		logger:      logger,
+
+		// https://www.rfc-editor.org/rfc/rfc6762.html#section-17
+		// Multicast DNS messages carried by UDP may be up to the IP MTU of the
+		// physical interface, less the space required for the IP header (20
+		// bytes for IPv4; 40 bytes for IPv6) and the UDP header (8 bytes).
+		inboundBufferSize: inboundBufferSize - 20 - 8,
 	}, nil
 }
 
@@ -515,13 +539,14 @@ func (c *client) query(params *lookupParams) error {
 
 // Pack the dns.Msg and write to available connections (multicast)
 func (c *client) sendQuery(msg *dns.Msg) error {
-	buf, err := msg.Pack()
+	b := make([]byte, c.inboundBufferSize)
+	buf, err := msg.PackBuffer(b)
 	if err != nil {
 		return err
 	}
 	if c.ipv4conn != nil {
-		for _, ifc := range c.ipv4Ifaces {
-			if err := c.ipv4conn.SetMulticastInterface(&ifc); err != nil {
+		for ifcIdx := range c.ipv4Ifaces {
+			if err := c.ipv4conn.SetMulticastInterface(&c.ipv4Ifaces[ifcIdx]); err != nil {
 				c.logger.Debugw("mdns: failed to set multicast interface", "error", err)
 			} else {
 				c.ipv4conn.WriteTo(buf, nil, ipv4Addr)
@@ -529,8 +554,8 @@ func (c *client) sendQuery(msg *dns.Msg) error {
 		}
 	}
 	if c.ipv6conn != nil {
-		for _, ifc := range c.ipv6Ifaces {
-			if err := c.ipv6conn.SetMulticastInterface(&ifc); err != nil {
+		for ifcIdx := range c.ipv6Ifaces {
+			if err := c.ipv6conn.SetMulticastInterface(&c.ipv6Ifaces[ifcIdx]); err != nil {
 				c.logger.Debugw("mdns: failed to set multicast interface", "error", err)
 			} else {
 				c.ipv6conn.WriteTo(buf, nil, ipv6Addr)
