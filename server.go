@@ -470,7 +470,7 @@ func (s *Server) handleQuestion(q dns.Question, resp *dns.Msg, query *dns.Msg, i
 			resp.Answer = nil
 		}
 
-	case s.service.ServiceName():
+	case s.service.ServiceName(), s.service.NonServiceHostName():
 		s.composeBrowsingAnswers(resp, ifIndex)
 		if isKnownAnswer(resp, query) {
 			resp.Answer = nil
