@@ -1,4 +1,4 @@
-module github.com/edaniels/zeroconf
+module github.com/viamrobotics/zeroconf
 
 go 1.13
 

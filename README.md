@@ -15,14 +15,14 @@ Though it does not support all requirements yet, the aim is to provide a complia
 By now, it should be compatible to [Avahi](http://avahi.org/) (tested) and Apple's Bonjour (untested).
 Target environments: private LAN/Wifi, small or isolated networks.
 
-[![GoDoc](https://godoc.org/github.com/edaniels/zeroconf?status.svg)](https://godoc.org/github.com/edaniels/zeroconf)
-[![Go Report Card](https://goreportcard.com/badge/github.com/edaniels/zeroconf)](https://goreportcard.com/report/github.com/edaniels/zeroconf)
-[![Tests](https://github.com/edaniels/zeroconf/actions/workflows/go-test.yml/badge.svg)](https://github.com/edaniels/zeroconf/actions/workflows/go-test.yml)
+[![GoDoc](https://godoc.org/github.com/viamrobotics/zeroconf?status.svg)](https://godoc.org/github.com/viamrobotics/zeroconf)
+[![Go Report Card](https://goreportcard.com/badge/github.com/viamrobotics/zeroconf)](https://goreportcard.com/report/github.com/viamrobotics/zeroconf)
+[![Tests](https://github.com/viamrobotics/zeroconf/actions/workflows/go-test.yml/badge.svg)](https://github.com/viamrobotics/zeroconf/actions/workflows/go-test.yml)
 
 ## Install
 Nothing is as easy as that:
 ```bash
-$ go get -u github.com/edaniels/zeroconf
+$ go get -u github.com/viamrobotics/zeroconf
 ```
 This package requires **Go 1.7** (context in std lib) or later.
 
@@ -52,9 +52,6 @@ if err != nil {
 
 <-ctx.Done()
 ```
-A subtype may added to service name to narrow the set of results. E.g. to browse `_workstation._tcp` with subtype `_windows`, use`_workstation._tcp,_windows`.
-
-See https://github.com/edaniels/zeroconf/blob/master/examples/resolv/client.go.
 
 ## Lookup a specific service instance
 
@@ -83,24 +80,6 @@ case <-time.After(time.Second * 120):
 
 log.Println("Shutting down.")
 ```
-Multiple subtypes may be added to service name, separated by commas. E.g `_workstation._tcp,_windows` has subtype `_windows`.
-
-See https://github.com/edaniels/zeroconf/blob/master/examples/register/server.go.
-
-## Features and ToDo's
-This list gives a quick impression about the state of this library.
-See what needs to be done and submit a pull request :)
-
-* [x] Browse / Lookup / Register services
-* [x] Multiple IPv6 / IPv4 addresses support
-* [x] Send multiple probes (exp. back-off) if no service answers (*)
-* [ ] Timestamp entries for TTL checks
-* [ ] Compare new multicasts with already received services
-
-_Notes:_
-
-(*) The denoted features might not be perfectly standards compliant, but shouldn't cause any problems.
-    Some tests showed improvements in overall robustness and performance with the features enabled.
 
 ## Credits
 Great thanks to [hashicorp](https://github.com/hashicorp/mdns) and to [oleksandr](https://github.com/oleksandr/bonjour) and all contributing authors for the code this projects bases upon.
