@@ -117,3 +117,9 @@ func NewServiceEntry(instance, service string, domain string) *ServiceEntry {
 		ServiceRecord: *NewServiceRecord(instance, service, domain),
 	}
 }
+
+// NonServiceHostName is used for matching questions against simple `machine-name.local`
+// requests. Not for service discovery requests.
+func (s *ServiceEntry) NonServiceHostName() string {
+	return s.HostName
+}
