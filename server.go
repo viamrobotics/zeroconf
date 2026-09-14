@@ -826,18 +826,19 @@ func (s *Server) multicastResponse(msg *dns.Msg, ifIndex int) error {
 	if s.ipv4conn != nil {
 		if ifIndex != 0 {
 			iface, _ := net.InterfaceByIndex(ifIndex)
+			// Send regardless of SetMulticastInterface: IP_MULTICAST_IF is
+			// unsupported under qemu-user (ENOPROTOOPT). (RSDK-14553)
 			if err := s.ipv4conn.SetMulticastInterface(iface); err != nil {
 				s.logger.Debugw("mdns: failed to set multicast interface", "error", err)
-			} else {
-				s.ipv4conn.WriteTo(buf, nil, ipv4Addr)
 			}
+			s.ipv4conn.WriteTo(buf, nil, ipv4Addr)
 		} else {
 			for ifcIdx := range s.ipv4Ifaces {
+				// Send regardless of SetMulticastInterface (RSDK-14553).
 				if err := s.ipv4conn.SetMulticastInterface(&s.ipv4Ifaces[ifcIdx]); err != nil {
 					s.logger.Debugw("mdns: failed to set multicast interface", "error", err)
-				} else {
-					s.ipv4conn.WriteTo(buf, nil, ipv4Addr)
 				}
+				s.ipv4conn.WriteTo(buf, nil, ipv4Addr)
 			}
 		}
 	}
@@ -845,18 +846,18 @@ func (s *Server) multicastResponse(msg *dns.Msg, ifIndex int) error {
 	if s.ipv6conn != nil {
 		if ifIndex != 0 {
 			iface, _ := net.InterfaceByIndex(ifIndex)
+			// Send regardless of SetMulticastInterface (RSDK-14553).
 			if err := s.ipv6conn.SetMulticastInterface(iface); err != nil {
 				s.logger.Debugw("mdns: failed to set multicast interface", "error", err)
-			} else {
-				s.ipv6conn.WriteTo(buf, nil, ipv6Addr)
 			}
+			s.ipv6conn.WriteTo(buf, nil, ipv6Addr)
 		} else {
 			for ifcIdx := range s.ipv6Ifaces {
+				// Send regardless of SetMulticastInterface (RSDK-14553).
 				if err := s.ipv6conn.SetMulticastInterface(&s.ipv6Ifaces[ifcIdx]); err != nil {
 					s.logger.Debugw("mdns: failed to set multicast interface", "error", err)
-				} else {
-					s.ipv6conn.WriteTo(buf, nil, ipv6Addr)
 				}
+				s.ipv6conn.WriteTo(buf, nil, ipv6Addr)
 			}
 		}
 	}

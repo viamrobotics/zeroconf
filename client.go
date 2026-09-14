@@ -550,20 +550,24 @@ func (c *client) sendQuery(msg *dns.Msg) error {
 	}
 	if c.ipv4conn != nil {
 		for ifcIdx := range c.ipv4Ifaces {
+			// IP_MULTICAST_IF is unsupported under some emulators (qemu-user
+			// returns ENOPROTOOPT), and interface selection is only an
+			// optimization for multi-homed hosts. Send regardless so the query
+			// still egresses via default routing rather than being dropped. (RSDK-14553)
 			if err := c.ipv4conn.SetMulticastInterface(&c.ipv4Ifaces[ifcIdx]); err != nil {
 				c.logger.Debugw("mdns: failed to set multicast interface", "error", err)
-			} else {
-				c.ipv4conn.WriteTo(buf, nil, ipv4Addr)
 			}
+			c.ipv4conn.WriteTo(buf, nil, ipv4Addr)
 		}
 	}
 	if c.ipv6conn != nil {
 		for ifcIdx := range c.ipv6Ifaces {
+			// See the IPv4 note above (RSDK-14553): send regardless of whether
+			// setting the multicast interface succeeded.
 			if err := c.ipv6conn.SetMulticastInterface(&c.ipv6Ifaces[ifcIdx]); err != nil {
 				c.logger.Debugw("mdns: failed to set multicast interface", "error", err)
-			} else {
-				c.ipv6conn.WriteTo(buf, nil, ipv6Addr)
 			}
+			c.ipv6conn.WriteTo(buf, nil, ipv6Addr)
 		}
 	}
 	return nil

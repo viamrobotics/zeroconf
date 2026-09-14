@@ -54,9 +54,14 @@ func joinUdp6Multicast(interfaces []net.Interface) (*ipv6.PacketConn, []net.Inte
 	joinedIfcs := make([]net.Interface, 0, len(interfaces))
 	for _, iface := range interfaces {
 		if err := pkConn.JoinGroup(&iface, &net.UDPAddr{IP: mdnsGroupIPv6}); err != nil {
-			// log.Println("Udp6 JoinGroup failed for iface ", iface)
-			failedJoins++
-			continue
+			// x/net joins via MCAST_JOIN_GROUP, which qemu-user does not support
+			// (ENOPROTOOPT), silently disabling mDNS for 32-bit builds under
+			// emulation. Fall back to the legacy IPV6_JOIN_GROUP on the same
+			// socket, which is emulated correctly. (RSDK-14553)
+			if ferr := legacyJoinGroup6(udpConn, &iface, mdnsGroupIPv6); ferr != nil {
+				failedJoins++
+				continue
+			}
 		}
 		ifaceCopy := iface
 		joinedIfcs = append(joinedIfcs, ifaceCopy)
@@ -89,9 +94,14 @@ func joinUdp4Multicast(interfaces []net.Interface) (*ipv4.PacketConn, []net.Inte
 	joinedIfcs := make([]net.Interface, 0, len(interfaces))
 	for _, iface := range interfaces {
 		if err := pkConn.JoinGroup(&iface, &net.UDPAddr{IP: mdnsGroupIPv4}); err != nil {
-			// log.Println("Udp4 JoinGroup failed for iface ", iface)
-			failedJoins++
-			continue
+			// x/net joins via MCAST_JOIN_GROUP, which qemu-user does not support
+			// (ENOPROTOOPT), silently disabling mDNS for 32-bit builds under
+			// emulation. Fall back to the legacy IP_ADD_MEMBERSHIP on the same
+			// socket, which is emulated correctly. (RSDK-14553)
+			if ferr := legacyJoinGroup4(udpConn, &iface, mdnsGroupIPv4); ferr != nil {
+				failedJoins++
+				continue
+			}
 		}
 		ifaceCopy := iface
 		joinedIfcs = append(joinedIfcs, ifaceCopy)
