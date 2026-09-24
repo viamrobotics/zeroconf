@@ -113,54 +113,14 @@ func RegisterProxy(
 	ifaces []net.Interface,
 	logger golog.Logger,
 ) (*Server, error) {
-	entry := NewServiceEntry(instance, service, domain)
-	entry.Port = port
-	entry.Text = text
-	entry.HostName = host
-
-	if entry.Instance == "" {
-		return nil, errors.New("missing service instance name")
+	entry, err := NewProxyServiceEntry(instance, service, domain, port, host, ips, text)
+	if err != nil {
+		return nil, err
 	}
-	if entry.Service == "" {
-		return nil, errors.New("missing service name")
-	}
-	if entry.HostName == "" {
-		return nil, errors.New("missing host name")
-	}
-	if entry.Domain == "" {
-		entry.Domain = "local"
-	}
-	if entry.Port == 0 {
-		return nil, errors.New("missing port")
-	}
-
-	if !strings.HasSuffix(trimDot(entry.HostName), entry.Domain) {
-		entry.HostName = fmt.Sprintf("%s.%s.", trimDot(entry.HostName), trimDot(entry.Domain))
-	}
-
-	for _, ip := range ips {
-		ipAddr := net.ParseIP(ip)
-		if ipAddr == nil {
-			return nil, fmt.Errorf("failed to parse given IP: %v", ip)
-		} else if ipv4 := ipAddr.To4(); ipv4 != nil {
-			entry.AddrIPv4 = append(entry.AddrIPv4, ipAddr)
-		} else if ipv6 := ipAddr.To16(); ipv6 != nil {
-			entry.AddrIPv6 = append(entry.AddrIPv6, ipAddr)
-		} else {
-			return nil, fmt.Errorf("the IP is neither IPv4 nor IPv6: %#v", ipAddr)
-		}
-	}
-
-	if len(ifaces) == 0 {
-		ifaces = listMulticastInterfaces()
-	}
-
-	return newServerForService(entry, ifaces, logger)
+	return RegisterMulti([]*ServiceEntry{entry}, ifaces, logger)
 }
 
-// NewProxyServiceEntry builds a ServiceEntry the way RegisterProxy does (skipping the
-// hostname/IP lookup and using the provided values), for callers that want to register
-// several entries on a single responder via RegisterMulti.
+// NewProxyServiceEntry builds a ServiceEntry.
 func NewProxyServiceEntry(
 	instance, service, domain string,
 	port int,
@@ -209,9 +169,7 @@ func NewProxyServiceEntry(
 	return entry, nil
 }
 
-// RegisterMulti registers several pre-built service entries on a single responder. All
-// entries share one set of sockets, so matching queries are answered with one aggregated
-// multicast response (RFC 6762 section 6.4) instead of one packet per entry.
+// RegisterMulti registers the passed in service entries on a single responder.
 func RegisterMulti(entries []*ServiceEntry, ifaces []net.Interface, logger golog.Logger) (*Server, error) {
 	if len(entries) == 0 {
 		return nil, errors.New("missing service entries")
@@ -508,9 +466,7 @@ func (s *Server) handleQuery(query *dns.Msg, ifIndex int, from net.Addr) error {
 
 // RFC6762 7.1. Known-Answer Suppression.
 //
-// filterKnownAnswers drops individual PTR answers the querier already knows, leaving the
-// rest of the aggregated response intact. It must be per-record: an aggregated response can
-// carry several entries' PTRs, and one known answer must not suppress the others.
+// filterKnownAnswers drops individual PTR answers the querier already knows.
 func filterKnownAnswers(resp *dns.Msg, query *dns.Msg) {
 	if len(resp.Answer) == 0 || len(query.Answer) == 0 {
 		return
@@ -526,8 +482,7 @@ func filterKnownAnswers(resp *dns.Msg, query *dns.Msg) {
 	resp.Answer = kept
 }
 
-// isKnownPTR reports whether rr is a PTR record already known (with a live enough TTL) to
-// the querier per its known-answer section.
+// isKnownPTR reports whether rr is a PTR record already known.
 func isKnownPTR(rr dns.RR, known []dns.RR) bool {
 	if rr.Header().Rrtype != dns.TypePTR {
 		return false
@@ -549,17 +504,16 @@ func isKnownPTR(rr dns.RR, known []dns.RR) bool {
 	return false
 }
 
-// handleQuestion is used to handle an incoming question. Every registered entry that matches
-// the question contributes its records to the same response so the responder emits a single
+// handleQuestion is used to handle an incoming question. The responder emits a single
 // aggregated multicast packet (RFC 6762 section 6.4).
 func (s *Server) handleQuestion(q dns.Question, resp *dns.Msg, query *dns.Msg, ifIndex int) error {
 	if len(s.services) == 0 {
 		return nil
 	}
 
-	// suppressKnown gates known-answer suppression to browse/type/subtype responses, matching
-	// the original behavior (instance lookups are never suppressed). seenTypePtr dedupes the
-	// _services._dns-sd._udp PTR so several entries of the same service type emit only one.
+	// suppressKnown and seenTypePTR makes sure we dedupe questions about service _types_
+	// and service _names_ but NOT service _instance names_. See server_test.go for an
+	// example of the difference.
 	suppressKnown := false
 	seenTypePtr := map[string]struct{}{}
 
@@ -723,8 +677,6 @@ func (s *Server) serviceTypeName(entry *ServiceEntry, resp *dns.Msg, ttl uint32)
 // Perform probing & announcement
 // TODO: implement a proper probing & conflict resolution
 func (s *Server) probe() {
-	// Probing stays per-name: each registered name is probed on its own so a conflict can be
-	// attributed to the specific name that collided.
 	probes := make([]*dns.Msg, 0, len(s.services))
 	for _, entry := range s.services {
 		q := new(dns.Msg)
