@@ -169,10 +169,25 @@ func NewProxyServiceEntry(
 	return entry, nil
 }
 
+// maxRegisterMultiEntries bounds how many entries one responder will aggregate into a
+// single response. The responder does not split oversized responses across packets, so
+// this limit tries to keep an aggregated response comfortably under the network MTU. It's
+// best effort: an individual entry can still be large enough to overflow MTU.
+const maxRegisterMultiEntries = 10
+
 // RegisterMulti registers the passed in service entries on a single responder.
 func RegisterMulti(entries []*ServiceEntry, ifaces []net.Interface, logger golog.Logger) (*Server, error) {
 	if len(entries) == 0 {
 		return nil, errors.New("missing service entries")
+	}
+	if len(entries) > maxRegisterMultiEntries {
+		return nil, fmt.Errorf("cannot register more than %d service entries on one responder, got %d",
+			maxRegisterMultiEntries, len(entries))
+	}
+	for i, entry := range entries {
+		if entry == nil {
+			return nil, fmt.Errorf("service entry at index %d is nil", i)
+		}
 	}
 	if len(ifaces) == 0 {
 		ifaces = listMulticastInterfaces()
@@ -465,39 +480,15 @@ func (s *Server) handleQuery(query *dns.Msg, ifIndex int, from net.Addr) error {
 }
 
 // RFC6762 7.1. Known-Answer Suppression.
-//
-// filterKnownAnswers drops individual PTR answers the querier already knows.
-func filterKnownAnswers(resp *dns.Msg, query *dns.Msg) {
-	if len(resp.Answer) == 0 || len(query.Answer) == 0 {
-		return
-	}
-
-	kept := resp.Answer[:0:0]
-	for _, rr := range resp.Answer {
-		if isKnownPTR(rr, query.Answer) {
-			continue
-		}
-		kept = append(kept, rr)
-	}
-	resp.Answer = kept
-}
-
-// isKnownPTR reports whether rr is a PTR record already known.
-func isKnownPTR(rr dns.RR, known []dns.RR) bool {
-	if rr.Header().Rrtype != dns.TypePTR {
-		return false
-	}
-	answer := rr.(*dns.PTR)
-	for _, k := range known {
-		hdr := k.Header()
+func isKnownAnswer(answer *dns.PTR, query *dns.Msg) bool {
+	for _, known := range query.Answer {
+		hdr := known.Header()
 		if hdr.Rrtype != answer.Hdr.Rrtype {
 			continue
 		}
-		ptr, ok := k.(*dns.PTR)
-		if !ok {
-			continue
-		}
+		ptr := known.(*dns.PTR)
 		if ptr.Ptr == answer.Ptr && hdr.Ttl >= answer.Hdr.Ttl/2 {
+			// log.Printf("skipping known answer: %v", ptr)
 			return true
 		}
 	}
@@ -511,24 +502,19 @@ func (s *Server) handleQuestion(q dns.Question, resp *dns.Msg, query *dns.Msg, i
 		return nil
 	}
 
-	// suppressKnown and seenTypePTR makes sure we dedupe questions about service _types_
-	// and service _names_ but NOT service _instance names_. See server_test.go for an
-	// example of the difference.
-	suppressKnown := false
-	seenTypePtr := map[string]struct{}{}
+	// Dedupes service type PTRs across entries.
+	seenTypePtrs := map[string]struct{}{}
 
 	for _, entry := range s.services {
 		switch q.Name {
 		case entry.ServiceTypeName():
-			if _, ok := seenTypePtr[entry.ServiceName()]; !ok {
-				seenTypePtr[entry.ServiceName()] = struct{}{}
-				s.serviceTypeName(entry, resp, s.ttl)
+			if _, ok := seenTypePtrs[entry.ServiceName()]; !ok {
+				seenTypePtrs[entry.ServiceName()] = struct{}{}
+				s.serviceTypeName(entry, resp, query, s.ttl)
 			}
-			suppressKnown = true
 
 		case entry.ServiceName(), entry.NonServiceHostName():
-			s.composeBrowsingAnswers(entry, resp, ifIndex)
-			suppressKnown = true
+			s.composeBrowsingAnswers(entry, resp, query, ifIndex)
 
 		case entry.ServiceInstanceName():
 			s.composeLookupAnswers(entry, resp, s.ttl, ifIndex, false)
@@ -537,22 +523,17 @@ func (s *Server) handleQuestion(q dns.Question, resp *dns.Msg, query *dns.Msg, i
 			for _, subtype := range entry.Subtypes {
 				subtype = fmt.Sprintf("%s._sub.%s", subtype, entry.ServiceName())
 				if q.Name == subtype {
-					s.composeBrowsingAnswers(entry, resp, ifIndex)
-					suppressKnown = true
+					s.composeBrowsingAnswers(entry, resp, query, ifIndex)
 					break
 				}
 			}
 		}
 	}
 
-	if suppressKnown {
-		filterKnownAnswers(resp, query)
-	}
-
 	return nil
 }
 
-func (s *Server) composeBrowsingAnswers(entry *ServiceEntry, resp *dns.Msg, ifIndex int) {
+func (s *Server) composeBrowsingAnswers(entry *ServiceEntry, resp *dns.Msg, query *dns.Msg, ifIndex int) {
 	ptr := &dns.PTR{
 		Hdr: dns.RR_Header{
 			Name:   entry.ServiceName(),
@@ -561,6 +542,10 @@ func (s *Server) composeBrowsingAnswers(entry *ServiceEntry, resp *dns.Msg, ifIn
 			Ttl:    s.ttl,
 		},
 		Ptr: entry.ServiceInstanceName(),
+	}
+	// Skip if known.
+	if isKnownAnswer(ptr, query) {
+		return
 	}
 	resp.Answer = append(resp.Answer, ptr)
 
@@ -653,7 +638,7 @@ func (s *Server) composeLookupAnswers(entry *ServiceEntry, resp *dns.Msg, ttl ui
 	resp.Answer = s.appendAddrs(entry, resp.Answer, ttl, ifIndex, flushCache)
 }
 
-func (s *Server) serviceTypeName(entry *ServiceEntry, resp *dns.Msg, ttl uint32) {
+func (s *Server) serviceTypeName(entry *ServiceEntry, resp *dns.Msg, query *dns.Msg, ttl uint32) {
 	// From RFC6762
 	// 9.  Service Type Enumeration
 	//
@@ -670,6 +655,10 @@ func (s *Server) serviceTypeName(entry *ServiceEntry, resp *dns.Msg, ttl uint32)
 			Ttl:    ttl,
 		},
 		Ptr: entry.ServiceName(),
+	}
+	// Skip if known.
+	if isKnownAnswer(dnssd, query) {
+		return
 	}
 	resp.Answer = append(resp.Answer, dnssd)
 }
