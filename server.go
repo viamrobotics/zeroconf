@@ -113,6 +113,21 @@ func RegisterProxy(
 	ifaces []net.Interface,
 	logger golog.Logger,
 ) (*Server, error) {
+	entry, err := NewProxyServiceEntry(instance, service, domain, port, host, ips, text)
+	if err != nil {
+		return nil, err
+	}
+	return RegisterMulti([]*ServiceEntry{entry}, ifaces, logger)
+}
+
+// NewProxyServiceEntry builds a ServiceEntry.
+func NewProxyServiceEntry(
+	instance, service, domain string,
+	port int,
+	host string,
+	ips []string,
+	text []string,
+) (*ServiceEntry, error) {
 	entry := NewServiceEntry(instance, service, domain)
 	entry.Port = port
 	entry.Text = text
@@ -151,20 +166,46 @@ func RegisterProxy(
 		}
 	}
 
+	return entry, nil
+}
+
+// maxRegisterMultiEntries bounds how many entries one responder will aggregate into a
+// single response. The responder does not split oversized responses across packets, so
+// this limit tries to keep an aggregated response comfortably under the network MTU. It's
+// best effort: an individual entry can still be large enough to overflow MTU.
+const maxRegisterMultiEntries = 6
+
+// RegisterMulti registers the passed in service entries on a single responder.
+func RegisterMulti(entries []*ServiceEntry, ifaces []net.Interface, logger golog.Logger) (*Server, error) {
+	if len(entries) == 0 {
+		return nil, errors.New("missing service entries")
+	}
+	if len(entries) > maxRegisterMultiEntries {
+		return nil, fmt.Errorf("cannot register more than %d service entries on one responder, got %d",
+			maxRegisterMultiEntries, len(entries))
+	}
+	for i, entry := range entries {
+		if entry == nil {
+			return nil, fmt.Errorf("service entry at index %d is nil", i)
+		}
+	}
 	if len(ifaces) == 0 {
 		ifaces = listMulticastInterfaces()
 	}
-
-	return newServerForService(entry, ifaces, logger)
+	return newServerForServices(entries, ifaces, logger)
 }
 
 func newServerForService(entry *ServiceEntry, ifaces []net.Interface, logger golog.Logger) (*Server, error) {
+	return newServerForServices([]*ServiceEntry{entry}, ifaces, logger)
+}
+
+func newServerForServices(entries []*ServiceEntry, ifaces []net.Interface, logger golog.Logger) (*Server, error) {
 	s, err := newServer(ifaces, logger)
 	if err != nil {
 		return nil, err
 	}
 
-	s.service = entry
+	s.services = entries
 	s.startReceivers()
 	s.shutdownEnd.Add(1)
 	s.startupWait.Add(1)
@@ -180,7 +221,7 @@ const (
 
 // Server structure encapsulates both IPv4/IPv6 UDP connections
 type Server struct {
-	service              *ServiceEntry
+	services             []*ServiceEntry
 	ipv4conn             *ipv4.PacketConn
 	ipv4Ifaces           []net.Interface
 	ipv6conn             *ipv6.PacketConn
@@ -285,13 +326,20 @@ func (s *Server) Shutdown() {
 
 // SetText updates and announces the TXT records
 func (s *Server) SetText(text []string) {
-	s.service.Text = text
+	for _, entry := range s.services {
+		entry.Text = text
+	}
 	s.announceText()
 }
 
 // TTL sets the TTL for DNS replies
 func (s *Server) TTL(ttl uint32) {
 	s.ttl = ttl
+}
+
+// NumServices returns the number of service entries this responder answers for.
+func (s *Server) NumServices() int {
+	return len(s.services)
 }
 
 // Shutdown server will close currently open connections & channel
@@ -431,17 +479,8 @@ func (s *Server) handleQuery(query *dns.Msg, ifIndex int, from net.Addr) error {
 	return err
 }
 
-// RFC6762 7.1. Known-Answer Suppression
-func isKnownAnswer(resp *dns.Msg, query *dns.Msg) bool {
-	if len(resp.Answer) == 0 || len(query.Answer) == 0 {
-		return false
-	}
-
-	if resp.Answer[0].Header().Rrtype != dns.TypePTR {
-		return false
-	}
-	answer := resp.Answer[0].(*dns.PTR)
-
+// RFC6762 7.1. Known-Answer Suppression.
+func isKnownAnswer(answer *dns.PTR, query *dns.Msg) bool {
 	for _, known := range query.Answer {
 		hdr := known.Header()
 		if hdr.Rrtype != answer.Hdr.Rrtype {
@@ -453,41 +492,40 @@ func isKnownAnswer(resp *dns.Msg, query *dns.Msg) bool {
 			return true
 		}
 	}
-
 	return false
 }
 
-// handleQuestion is used to handle an incoming question
+// handleQuestion is used to handle an incoming question. The responder emits a single
+// aggregated multicast packet (RFC 6762 section 6.4).
 func (s *Server) handleQuestion(q dns.Question, resp *dns.Msg, query *dns.Msg, ifIndex int) error {
-	if s.service == nil {
+	if len(s.services) == 0 {
 		return nil
 	}
 
-	switch q.Name {
-	case s.service.ServiceTypeName():
-		s.serviceTypeName(resp, s.ttl)
-		if isKnownAnswer(resp, query) {
-			resp.Answer = nil
-		}
+	// Dedupes service type PTRs across entries.
+	seenTypePtrs := map[string]struct{}{}
 
-	case s.service.ServiceName(), s.service.NonServiceHostName():
-		s.composeBrowsingAnswers(resp, ifIndex)
-		if isKnownAnswer(resp, query) {
-			resp.Answer = nil
-		}
+	for _, entry := range s.services {
+		switch q.Name {
+		case entry.ServiceTypeName():
+			if _, ok := seenTypePtrs[entry.ServiceName()]; !ok {
+				seenTypePtrs[entry.ServiceName()] = struct{}{}
+				s.serviceTypeName(entry, resp, query, s.ttl)
+			}
 
-	case s.service.ServiceInstanceName():
-		s.composeLookupAnswers(resp, s.ttl, ifIndex, false)
-	default:
-		// handle matching subtype query
-		for _, subtype := range s.service.Subtypes {
-			subtype = fmt.Sprintf("%s._sub.%s", subtype, s.service.ServiceName())
-			if q.Name == subtype {
-				s.composeBrowsingAnswers(resp, ifIndex)
-				if isKnownAnswer(resp, query) {
-					resp.Answer = nil
+		case entry.ServiceName(), entry.NonServiceHostName():
+			s.composeBrowsingAnswers(entry, resp, query, ifIndex)
+
+		case entry.ServiceInstanceName():
+			s.composeLookupAnswers(entry, resp, s.ttl, ifIndex, false)
+		default:
+			// handle matching subtype query
+			for _, subtype := range entry.Subtypes {
+				subtype = fmt.Sprintf("%s._sub.%s", subtype, entry.ServiceName())
+				if q.Name == subtype {
+					s.composeBrowsingAnswers(entry, resp, query, ifIndex)
+					break
 				}
-				break
 			}
 		}
 	}
@@ -495,45 +533,49 @@ func (s *Server) handleQuestion(q dns.Question, resp *dns.Msg, query *dns.Msg, i
 	return nil
 }
 
-func (s *Server) composeBrowsingAnswers(resp *dns.Msg, ifIndex int) {
+func (s *Server) composeBrowsingAnswers(entry *ServiceEntry, resp *dns.Msg, query *dns.Msg, ifIndex int) {
 	ptr := &dns.PTR{
 		Hdr: dns.RR_Header{
-			Name:   s.service.ServiceName(),
+			Name:   entry.ServiceName(),
 			Rrtype: dns.TypePTR,
 			Class:  dns.ClassINET,
 			Ttl:    s.ttl,
 		},
-		Ptr: s.service.ServiceInstanceName(),
+		Ptr: entry.ServiceInstanceName(),
+	}
+	// Skip if known.
+	if isKnownAnswer(ptr, query) {
+		return
 	}
 	resp.Answer = append(resp.Answer, ptr)
 
 	txt := &dns.TXT{
 		Hdr: dns.RR_Header{
-			Name:   s.service.ServiceInstanceName(),
+			Name:   entry.ServiceInstanceName(),
 			Rrtype: dns.TypeTXT,
 			Class:  dns.ClassINET,
 			Ttl:    s.ttl,
 		},
-		Txt: s.service.Text,
+		Txt: entry.Text,
 	}
 	srv := &dns.SRV{
 		Hdr: dns.RR_Header{
-			Name:   s.service.ServiceInstanceName(),
+			Name:   entry.ServiceInstanceName(),
 			Rrtype: dns.TypeSRV,
 			Class:  dns.ClassINET,
 			Ttl:    s.ttl,
 		},
 		Priority: 0,
 		Weight:   0,
-		Port:     uint16(s.service.Port),
-		Target:   s.service.HostName,
+		Port:     uint16(entry.Port),
+		Target:   entry.HostName,
 	}
 	resp.Extra = append(resp.Extra, srv, txt)
 
-	resp.Extra = s.appendAddrs(resp.Extra, s.ttl, ifIndex, false)
+	resp.Extra = s.appendAddrs(entry, resp.Extra, s.ttl, ifIndex, false)
 }
 
-func (s *Server) composeLookupAnswers(resp *dns.Msg, ttl uint32, ifIndex int, flushCache bool) {
+func (s *Server) composeLookupAnswers(entry *ServiceEntry, resp *dns.Msg, ttl uint32, ifIndex int, flushCache bool) {
 	// From RFC6762
 	//    The most significant bit of the rrclass for a record in the Answer
 	//    Section of a response message is the Multicast DNS cache-flush bit
@@ -541,46 +583,46 @@ func (s *Server) composeLookupAnswers(resp *dns.Msg, ttl uint32, ifIndex int, fl
 	//    to Flush Outdated Cache Entries".
 	ptr := &dns.PTR{
 		Hdr: dns.RR_Header{
-			Name:   s.service.ServiceName(),
+			Name:   entry.ServiceName(),
 			Rrtype: dns.TypePTR,
 			Class:  dns.ClassINET,
 			Ttl:    ttl,
 		},
-		Ptr: s.service.ServiceInstanceName(),
+		Ptr: entry.ServiceInstanceName(),
 	}
 	srv := &dns.SRV{
 		Hdr: dns.RR_Header{
-			Name:   s.service.ServiceInstanceName(),
+			Name:   entry.ServiceInstanceName(),
 			Rrtype: dns.TypeSRV,
 			Class:  dns.ClassINET | qClassCacheFlush,
 			Ttl:    ttl,
 		},
 		Priority: 0,
 		Weight:   0,
-		Port:     uint16(s.service.Port),
-		Target:   s.service.HostName,
+		Port:     uint16(entry.Port),
+		Target:   entry.HostName,
 	}
 	txt := &dns.TXT{
 		Hdr: dns.RR_Header{
-			Name:   s.service.ServiceInstanceName(),
+			Name:   entry.ServiceInstanceName(),
 			Rrtype: dns.TypeTXT,
 			Class:  dns.ClassINET | qClassCacheFlush,
 			Ttl:    ttl,
 		},
-		Txt: s.service.Text,
+		Txt: entry.Text,
 	}
 	dnssd := &dns.PTR{
 		Hdr: dns.RR_Header{
-			Name:   s.service.ServiceTypeName(),
+			Name:   entry.ServiceTypeName(),
 			Rrtype: dns.TypePTR,
 			Class:  dns.ClassINET,
 			Ttl:    ttl,
 		},
-		Ptr: s.service.ServiceName(),
+		Ptr: entry.ServiceName(),
 	}
 	resp.Answer = append(resp.Answer, srv, txt, ptr, dnssd)
 
-	for _, subtype := range s.service.Subtypes {
+	for _, subtype := range entry.Subtypes {
 		resp.Answer = append(resp.Answer,
 			&dns.PTR{
 				Hdr: dns.RR_Header{
@@ -589,14 +631,14 @@ func (s *Server) composeLookupAnswers(resp *dns.Msg, ttl uint32, ifIndex int, fl
 					Class:  dns.ClassINET,
 					Ttl:    ttl,
 				},
-				Ptr: s.service.ServiceInstanceName(),
+				Ptr: entry.ServiceInstanceName(),
 			})
 	}
 
-	resp.Answer = s.appendAddrs(resp.Answer, ttl, ifIndex, flushCache)
+	resp.Answer = s.appendAddrs(entry, resp.Answer, ttl, ifIndex, flushCache)
 }
 
-func (s *Server) serviceTypeName(resp *dns.Msg, ttl uint32) {
+func (s *Server) serviceTypeName(entry *ServiceEntry, resp *dns.Msg, query *dns.Msg, ttl uint32) {
 	// From RFC6762
 	// 9.  Service Type Enumeration
 	//
@@ -607,12 +649,16 @@ func (s *Server) serviceTypeName(resp *dns.Msg, ttl uint32) {
 	//    "_http._tcp.<Domain>".
 	dnssd := &dns.PTR{
 		Hdr: dns.RR_Header{
-			Name:   s.service.ServiceTypeName(),
+			Name:   entry.ServiceTypeName(),
 			Rrtype: dns.TypePTR,
 			Class:  dns.ClassINET,
 			Ttl:    ttl,
 		},
-		Ptr: s.service.ServiceName(),
+		Ptr: entry.ServiceName(),
+	}
+	// Skip if known.
+	if isKnownAnswer(dnssd, query) {
+		return
 	}
 	resp.Answer = append(resp.Answer, dnssd)
 }
@@ -620,38 +666,44 @@ func (s *Server) serviceTypeName(resp *dns.Msg, ttl uint32) {
 // Perform probing & announcement
 // TODO: implement a proper probing & conflict resolution
 func (s *Server) probe() {
-	q := new(dns.Msg)
-	q.SetQuestion(s.service.ServiceInstanceName(), dns.TypePTR)
-	q.RecursionDesired = false
+	probes := make([]*dns.Msg, 0, len(s.services))
+	for _, entry := range s.services {
+		q := new(dns.Msg)
+		q.SetQuestion(entry.ServiceInstanceName(), dns.TypePTR)
+		q.RecursionDesired = false
 
-	srv := &dns.SRV{
-		Hdr: dns.RR_Header{
-			Name:   s.service.ServiceInstanceName(),
-			Rrtype: dns.TypeSRV,
-			Class:  dns.ClassINET,
-			Ttl:    s.ttl,
-		},
-		Priority: 0,
-		Weight:   0,
-		Port:     uint16(s.service.Port),
-		Target:   s.service.HostName,
+		srv := &dns.SRV{
+			Hdr: dns.RR_Header{
+				Name:   entry.ServiceInstanceName(),
+				Rrtype: dns.TypeSRV,
+				Class:  dns.ClassINET,
+				Ttl:    s.ttl,
+			},
+			Priority: 0,
+			Weight:   0,
+			Port:     uint16(entry.Port),
+			Target:   entry.HostName,
+		}
+		txt := &dns.TXT{
+			Hdr: dns.RR_Header{
+				Name:   entry.ServiceInstanceName(),
+				Rrtype: dns.TypeTXT,
+				Class:  dns.ClassINET,
+				Ttl:    s.ttl,
+			},
+			Txt: entry.Text,
+		}
+		q.Ns = []dns.RR{srv, txt}
+		probes = append(probes, q)
 	}
-	txt := &dns.TXT{
-		Hdr: dns.RR_Header{
-			Name:   s.service.ServiceInstanceName(),
-			Rrtype: dns.TypeTXT,
-			Class:  dns.ClassINET,
-			Ttl:    s.ttl,
-		},
-		Txt: s.service.Text,
-	}
-	q.Ns = []dns.RR{srv, txt}
 
 	randomizer := rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	for i := 0; i < multicastRepetitions; i++ {
-		if err := s.multicastResponse(q, 0); err != nil {
-			s.logger.Debugw("failed to send probe", "error", err.Error())
+		for _, q := range probes {
+			if err := s.multicastResponse(q, 0); err != nil {
+				s.logger.Debugw("failed to send probe", "error", err.Error())
+			}
 		}
 		if i == 0 {
 			s.startupWait.Done()
@@ -676,7 +728,9 @@ func (s *Server) probe() {
 			resp.Compress = true
 			resp.Answer = []dns.RR{}
 			resp.Extra = []dns.RR{}
-			s.composeLookupAnswers(resp, s.ttl, intfIndex, true)
+			for _, entry := range s.services {
+				s.composeLookupAnswers(entry, resp, s.ttl, intfIndex, true)
+			}
 			if err := s.multicastResponse(resp, intfIndex); err != nil {
 				s.logger.Debugw("failed to send announcement", "error", err.Error())
 			}
@@ -692,18 +746,20 @@ func (s *Server) probe() {
 func (s *Server) announceText() {
 	resp := new(dns.Msg)
 	resp.MsgHdr.Response = true
+	resp.Answer = make([]dns.RR, 0, len(s.services))
 
-	txt := &dns.TXT{
-		Hdr: dns.RR_Header{
-			Name:   s.service.ServiceInstanceName(),
-			Rrtype: dns.TypeTXT,
-			Class:  dns.ClassINET | qClassCacheFlush,
-			Ttl:    s.ttl,
-		},
-		Txt: s.service.Text,
+	for _, entry := range s.services {
+		resp.Answer = append(resp.Answer, &dns.TXT{
+			Hdr: dns.RR_Header{
+				Name:   entry.ServiceInstanceName(),
+				Rrtype: dns.TypeTXT,
+				Class:  dns.ClassINET | qClassCacheFlush,
+				Ttl:    s.ttl,
+			},
+			Txt: entry.Text,
+		})
 	}
 
-	resp.Answer = []dns.RR{txt}
 	s.multicastResponse(resp, 0)
 }
 
@@ -712,13 +768,15 @@ func (s *Server) unregister() error {
 	resp.MsgHdr.Response = true
 	resp.Answer = []dns.RR{}
 	resp.Extra = []dns.RR{}
-	s.composeLookupAnswers(resp, 0, 0, true)
+	for _, entry := range s.services {
+		s.composeLookupAnswers(entry, resp, 0, 0, true)
+	}
 	return s.multicastResponse(resp, 0)
 }
 
-func (s *Server) appendAddrs(list []dns.RR, ttl uint32, ifIndex int, flushCache bool) []dns.RR {
-	v4 := s.service.AddrIPv4
-	v6 := s.service.AddrIPv6
+func (s *Server) appendAddrs(entry *ServiceEntry, list []dns.RR, ttl uint32, ifIndex int, flushCache bool) []dns.RR {
+	v4 := entry.AddrIPv4
+	v6 := entry.AddrIPv6
 	if len(v4) == 0 && len(v6) == 0 {
 		iface, _ := net.InterfaceByIndex(ifIndex)
 		if iface != nil {
@@ -740,7 +798,7 @@ func (s *Server) appendAddrs(list []dns.RR, ttl uint32, ifIndex int, flushCache 
 	for _, ipv4 := range v4 {
 		a := &dns.A{
 			Hdr: dns.RR_Header{
-				Name:   s.service.HostName,
+				Name:   entry.HostName,
 				Rrtype: dns.TypeA,
 				Class:  dns.ClassINET | cacheFlushBit,
 				Ttl:    ttl,
@@ -752,7 +810,7 @@ func (s *Server) appendAddrs(list []dns.RR, ttl uint32, ifIndex int, flushCache 
 	for _, ipv6 := range v6 {
 		aaaa := &dns.AAAA{
 			Hdr: dns.RR_Header{
-				Name:   s.service.HostName,
+				Name:   entry.HostName,
 				Rrtype: dns.TypeAAAA,
 				Class:  dns.ClassINET | cacheFlushBit,
 				Ttl:    ttl,
