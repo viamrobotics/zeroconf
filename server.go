@@ -173,7 +173,7 @@ func NewProxyServiceEntry(
 // single response. The responder does not split oversized responses across packets, so
 // this limit tries to keep an aggregated response comfortably under the network MTU. It's
 // best effort: an individual entry can still be large enough to overflow MTU.
-const maxRegisterMultiEntries = 10
+const maxRegisterMultiEntries = 6
 
 // RegisterMulti registers the passed in service entries on a single responder.
 func RegisterMulti(entries []*ServiceEntry, ifaces []net.Interface, logger golog.Logger) (*Server, error) {
