@@ -10,12 +10,16 @@ import (
 	"time"
 
 	"github.com/cenkalti/backoff"
-	"github.com/edaniels/golog"
 	"github.com/miekg/dns"
 	"go.uber.org/multierr"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 )
+
+// Logger is the minimal logging surface zeroconf needs from its caller.
+type Logger interface {
+	Debugw(msg string, keysAndValues ...any)
+}
 
 // IPType specifies the IP traffic the client listens for.
 // This does not guarantee that only mDNS entries of this sepcific
@@ -77,7 +81,7 @@ type Resolver struct {
 
 // NewResolver creates a new resolver and joins the UDP multicast groups to
 // listen for mDNS messages.
-func NewResolver(logger golog.Logger, options ...ClientOption) (*Resolver, error) {
+func NewResolver(logger Logger, options ...ClientOption) (*Resolver, error) {
 	// Apply default configuration and load supplied options.
 	var conf = clientOpts{
 		listenOn:   IPv4AndIPv6,
@@ -191,7 +195,7 @@ type client struct {
 	ipv6conn          *ipv6.PacketConn
 	ipv6Ifaces        []net.Interface
 	acceptOnly        IPType
-	logger            golog.Logger
+	logger            Logger
 	inboundBufferSize int
 }
 
@@ -202,7 +206,7 @@ func newClient(
 	shutdownCtx context.Context,
 	shutdownEnd *sync.WaitGroup,
 	opts clientOpts,
-	logger golog.Logger,
+	logger Logger,
 ) (*client, error) {
 	ifaces := opts.ifaces
 	if len(ifaces) == 0 {

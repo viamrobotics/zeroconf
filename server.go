@@ -11,7 +11,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/edaniels/golog"
 	"github.com/miekg/dns"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -29,7 +28,7 @@ func Register(
 	port int,
 	text []string,
 	ifaces []net.Interface,
-	logger golog.Logger,
+	logger Logger,
 ) (*Server, error) {
 	return register(instance, service, domain, port, text, ifaces, false, logger)
 }
@@ -41,7 +40,7 @@ func RegisterDynamic(
 	port int,
 	text []string,
 	ifaces []net.Interface,
-	logger golog.Logger,
+	logger Logger,
 ) (*Server, error) {
 	return register(instance, service, domain, port, text, ifaces, true, logger)
 }
@@ -52,7 +51,7 @@ func register(
 	text []string,
 	ifaces []net.Interface,
 	dynamic bool,
-	logger golog.Logger,
+	logger Logger,
 ) (*Server, error) {
 	entry := NewServiceEntry(instance, service, domain)
 	entry.Port = port
@@ -111,7 +110,7 @@ func RegisterProxy(
 	ips []string,
 	text []string,
 	ifaces []net.Interface,
-	logger golog.Logger,
+	logger Logger,
 ) (*Server, error) {
 	entry, err := NewProxyServiceEntry(instance, service, domain, port, host, ips, text)
 	if err != nil {
@@ -176,7 +175,7 @@ func NewProxyServiceEntry(
 const maxRegisterMultiEntries = 6
 
 // RegisterMulti registers the passed in service entries on a single responder.
-func RegisterMulti(entries []*ServiceEntry, ifaces []net.Interface, logger golog.Logger) (*Server, error) {
+func RegisterMulti(entries []*ServiceEntry, ifaces []net.Interface, logger Logger) (*Server, error) {
 	if len(entries) == 0 {
 		return nil, errors.New("missing service entries")
 	}
@@ -195,11 +194,11 @@ func RegisterMulti(entries []*ServiceEntry, ifaces []net.Interface, logger golog
 	return newServerForServices(entries, ifaces, logger)
 }
 
-func newServerForService(entry *ServiceEntry, ifaces []net.Interface, logger golog.Logger) (*Server, error) {
+func newServerForService(entry *ServiceEntry, ifaces []net.Interface, logger Logger) (*Server, error) {
 	return newServerForServices([]*ServiceEntry{entry}, ifaces, logger)
 }
 
-func newServerForServices(entries []*ServiceEntry, ifaces []net.Interface, logger golog.Logger) (*Server, error) {
+func newServerForServices(entries []*ServiceEntry, ifaces []net.Interface, logger Logger) (*Server, error) {
 	s, err := newServer(ifaces, logger)
 	if err != nil {
 		return nil, err
@@ -227,7 +226,7 @@ type Server struct {
 	ipv6conn             *ipv6.PacketConn
 	ipv6Ifaces           []net.Interface
 	selectedIfaceIndexes map[int]struct{}
-	logger               golog.Logger
+	logger               Logger
 	inboundBufferSize    int
 
 	shutdownCtx       context.Context
@@ -240,7 +239,7 @@ type Server struct {
 }
 
 // Constructs server structure
-func newServer(ifaces []net.Interface, logger golog.Logger) (*Server, error) {
+func newServer(ifaces []net.Interface, logger Logger) (*Server, error) {
 	ipv4conn, ipv4Ifaces, err4 := joinUdp4Multicast(ifaces)
 	if err4 != nil {
 		logger.Debugw("no suitable IPv4 interface", "error", err4.Error())
